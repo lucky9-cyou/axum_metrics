@@ -1,3 +1,5 @@
+// main.rs
+
 use axum::{
     Json, Router,
     extract::WebSocketUpgrade,
@@ -9,11 +11,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::net::TcpListener;
-// Needed for manual stream reading
 
 use observability_lib::client::{TrackExternal, track_stream};
 use observability_lib::{
-    Trackable, WsTracker, setup_observability, spawn_monitored, traffic_layer,
+    ServiceMap, Trackable, WsTracker, setup_observability, spawn_monitored, tag_service_with_state,
+    traffic_layer,
 };
 
 use async_openai::{
@@ -29,7 +31,6 @@ use async_openai::{
 async fn main() {
     dotenv::dotenv().ok();
 
-    // SAFETY CHECK: Ensure API Key doesn't have hidden newlines (Common cause of Header Errors)
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         if key.trim() != key {
             eprintln!(
@@ -40,6 +41,18 @@ async fn main() {
 
     let handle = setup_observability().expect("Init failed");
 
+    // Define your application/service names per route (self-defined).
+    // Add as many exact/prefix rules as you need.
+    let service_map = ServiceMap::new("gateway")
+        .exact("/chat/stream", "llm_service")
+        .exact("/chat/ask", "llm_service")
+        .exact("/order", "order_service")
+        .exact("/prices", "market_data_service")
+        .exact("/chat", "ws_chat")
+        .prefix("/api/v1/orders", "orders_v1")
+        .prefix("/api/v1", "api_v1")
+        .exact("/metrics", "metrics");
+
     let app = Router::new()
         .route("/chat/stream", post(llm_stream_handler))
         .route("/chat/ask", post(llm_unary_handler))
@@ -47,7 +60,13 @@ async fn main() {
         .route("/prices", get(crypto_stream))
         .route("/chat", get(chat_handler))
         .route("/metrics", get(move || std::future::ready(handle.render())))
-        .layer(axum::middleware::from_fn(traffic_layer));
+        // Inner layer: records HTTP metrics (expects ServiceTag to be set)
+        .layer(axum::middleware::from_fn(traffic_layer))
+        // Outermost layer: set per-route service/application label (fixes E0277)
+        .layer(axum::middleware::from_fn_with_state(
+            service_map,
+            tag_service_with_state,
+        ));
 
     println!("🚀 Server running on http://127.0.0.1:3000");
     let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -77,7 +96,7 @@ fn get_model() -> String {
 }
 
 // ============================================================================
-// HANDLERS
+// HANDLERS (unchanged)
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +112,6 @@ async fn llm_stream_handler() -> Json<Value> {
     let client = get_openai_client();
     let model = get_model();
 
-    // 1. Build Request Body (Same as your reference)
     let body = json!({
         "model": model,
         "messages": [
@@ -105,26 +123,21 @@ async fn llm_stream_handler() -> Json<Value> {
 
     tracing::info!("Starting Stream Request...");
 
-    // Start timing for local chunk logic
     let start_local = std::time::Instant::now();
 
-    // 2. Handshake using LIB.RS (.track_external)
-    // We use create_stream_byot as requested
     let result = client
         .chat()
         .create_stream_byot(body)
-        .track_external("gpt_handshake") // <--- Using lib.rs
+        .track_external("gpt_handshake", &model)
         .await
-        .track(); // <--- Using lib.rs
+        .track();
 
     match result {
         Ok(stream) => {
             tracing::info!("Stream Handshake OK. Reading chunks...");
 
-            // 3. Wrap Stream using LIB.RS (track_stream)
-            let mut monitored = track_stream(stream, "gpt_generation"); // <--- Using lib.rs
+            let mut monitored = track_stream(stream, "gpt_generation", &model);
 
-            // 4. Your Logic (Accumulator)
             let mut acc = String::with_capacity(2048);
             let mut chunks: Vec<StreamChunkRecord> = Vec::with_capacity(128);
             let mut idx = 0usize;
@@ -133,17 +146,14 @@ async fn llm_stream_handler() -> Json<Value> {
             while let Some(evt) = monitored.next().await {
                 match evt {
                     Ok(chunk) => {
-                        // Cast to specific type
                         let chunk: CreateChatCompletionStreamResponse = chunk;
                         let elapsed = start_local.elapsed().as_millis();
 
-                        // record meta snapshot
                         last_response_meta = Some(
                             serde_json::to_value(&chunk)
                                 .unwrap_or_else(|_| json!({"error": "serialize_failed"})),
                         );
 
-                        // collect deltas
                         let mut delta_str: Option<String> = None;
                         for choice in &chunk.choices {
                             if let Some(delta) = &choice.delta.content {
@@ -198,7 +208,7 @@ async fn llm_unary_handler() -> Json<Value> {
     let model = get_model();
 
     let request = CreateChatCompletionRequestArgs::default()
-        .model(model)
+        .model(model.clone())
         .messages([ChatCompletionRequestUserMessageArgs::default()
             .content("Write a haiku about Rust.")
             .build()
@@ -210,7 +220,7 @@ async fn llm_unary_handler() -> Json<Value> {
     let response = client
         .chat()
         .create(request)
-        .track_external("gpt_unary")
+        .track_external("gpt_unary", &model)
         .await
         .track();
 
@@ -229,12 +239,11 @@ async fn llm_unary_handler() -> Json<Value> {
 
 #[tracing::instrument(fields(service = "order_service"), ret)]
 async fn create_order() -> Json<Value> {
-    // Run email_user in the parent span; the event will be emitted inside email_user now.
     spawn_monitored(async {
-        let _ = email_user().await; // no .track() here anymore
+        let _ = email_user().await;
     });
     if rand::random::<f32>() < 0.3 {
-        let _ = process_payment().await; // no .track() here anymore
+        let _ = process_payment().await;
         return Json(json!({ "status": "failed" }));
     }
     Json(json!({ "status": "created" }))
@@ -255,7 +264,7 @@ async fn crypto_stream() -> Sse<impl Stream<Item = Result<Event, std::convert::I
 
 async fn chat_handler(ws: WebSocketUpgrade) -> impl axum::response::IntoResponse {
     ws.on_upgrade(|mut socket| async move {
-        let _tracker = WsTracker::new("chat_module");
+        let _tracker = WsTracker::new("ws_chat");
         while let Some(Ok(msg)) = socket.recv().await {
             if let axum::extract::ws::Message::Text(t) = msg {
                 let _ = socket.send(axum::extract::ws::Message::Text(t)).await;

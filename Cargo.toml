@@ -30,4 +30,3 @@ async-trait = "0.1.89"
 
 async-openai = {git = "https://github.com/lucky9-cyou/async-openai.git", branch = "fix/fix-groq", features = ["byot"]}
 dotenv = "0.15.0"
-log4rs = "1.4.0"

@@ -1,18 +1,20 @@
+// lib.rs (observability_lib)
+
 use axum::{
     body::Body,
-    extract::MatchedPath,
+    extract::{MatchedPath, State},
     http::{Request, Response},
     middleware::Next,
 };
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use pin_project_lite::pin_project;
 use reqwest::header::CONTENT_TYPE;
 use std::{
     borrow::Cow,
     future::Future,
     pin::Pin,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     task::{Context as TaskContext, Poll},
     time::Instant,
 };
@@ -26,6 +28,79 @@ use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 static RECORDER_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 const METRIC_TARGET: &str = "metrics::signal";
+const SVC_CTX_SPAN: &str = "svc_ctx";
+
+// ----------------------------------------------------------------------------
+// Service tagging (application name per route), user-definable
+// ----------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct ServiceTag(pub String);
+
+#[derive(Clone)]
+pub struct ServiceMap {
+    default: String,
+    rules: Arc<Vec<(Rule, String)>>,
+}
+
+#[derive(Clone)]
+enum Rule {
+    Exact(String),
+    Prefix(String),
+}
+
+impl ServiceMap {
+    pub fn new(default: impl Into<String>) -> Self {
+        Self {
+            default: default.into(),
+            rules: Arc::new(Vec::new()),
+        }
+    }
+
+    pub fn exact(mut self, path: impl Into<String>, service: impl Into<String>) -> Self {
+        let mut rules = (*self.rules).clone();
+        rules.push((Rule::Exact(path.into()), service.into()));
+        self.rules = Arc::new(rules);
+        self
+    }
+
+    pub fn prefix(mut self, prefix: impl Into<String>, service: impl Into<String>) -> Self {
+        let mut rules = (*self.rules).clone();
+        rules.push((Rule::Prefix(prefix.into()), service.into()));
+        self.rules = Arc::new(rules);
+        self
+    }
+
+    fn choose(&self, route: &str) -> String {
+        for (rule, svc) in self.rules.iter() {
+            match rule {
+                Rule::Exact(p) if route == p => return svc.clone(),
+                Rule::Prefix(pf) if route.starts_with(pf) => return svc.clone(),
+                _ => {}
+            }
+        }
+        self.default.clone()
+    }
+}
+
+pub async fn tag_service_with_state(
+    State(service_map): State<ServiceMap>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched_route".to_string());
+
+    let service = service_map.choose(&route);
+    req.extensions_mut().insert(ServiceTag(service.clone()));
+
+    // Create a parent span that carries the service label so function spans inherit it.
+    let span = tracing::info_span!(SVC_CTX_SPAN, service = service.as_str());
+    next.run(req).instrument(span).await
+}
 
 struct ConnectionGuard {
     type_label: &'static str,
@@ -83,7 +158,12 @@ pub async fn traffic_layer(req: Request<Body>, next: Next) -> Response<Body> {
         .unwrap_or(Cow::Borrowed("unmatched_route"));
 
     let method = req.method().as_str().to_owned();
-    let service = "gateway".to_string();
+
+    let service = req
+        .extensions()
+        .get::<ServiceTag>()
+        .map(|s| s.0.clone())
+        .unwrap_or_else(|| "gateway".to_string());
 
     let response = next.run(req).await;
     let status = response.status().as_u16().to_string();
@@ -114,9 +194,9 @@ pub async fn traffic_layer(req: Request<Body>, next: Next) -> Response<Body> {
     .increment(1);
 
     if !is_ws_handshake {
-        histogram!("http_request_duration_seconds",
-            "route" => route,
-            "method" => method,
+        histogram!("http_request_duration_seconds_ms",
+            "route" => route.clone(),
+            "method" => method.clone(),
             "type" => type_lbl,
             "service" => service.clone()
         )
@@ -126,7 +206,6 @@ pub async fn traffic_layer(req: Request<Body>, next: Next) -> Response<Body> {
     if is_ws_handshake {
         response
     } else {
-        // increment with the correct type, including "sse"
         gauge!("http_requests_active",
             "type" => type_lbl,
             "service" => service.clone()
@@ -137,7 +216,6 @@ pub async fn traffic_layer(req: Request<Body>, next: Next) -> Response<Body> {
         let monitored_body = MonitoredBody {
             inner: body,
             _guard: Some(ConnectionGuard {
-                // ensure drop uses the same label
                 type_label: if is_sse { "sse" } else { "http" },
                 service_label: service,
             }),
@@ -145,10 +223,6 @@ pub async fn traffic_layer(req: Request<Body>, next: Next) -> Response<Body> {
         Response::from_parts(parts, Body::new(monitored_body))
     }
 }
-
-// ============================================================================
-// 4. WEBSOCKET TRACKER
-// ============================================================================
 
 pub struct WsTracker {
     service: &'static str,
@@ -202,7 +276,7 @@ where
         };
 
         let name = span.name();
-        if name == "request" {
+        if name == "request" || name == SVC_CTX_SPAN {
             return;
         }
 
@@ -212,11 +286,11 @@ where
             .map(|s| s.0.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        histogram!("function_duration_seconds",
+        histogram!("function_duration_seconds_ms",
             "function" => name,
             "service" => service
         )
-        .record(start.elapsed().as_secs_f64());
+        .record(start.elapsed().as_millis() as f64);
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
@@ -231,8 +305,6 @@ where
         let mut svc: Option<String> = None;
         let mut func: Option<String> = None;
 
-        // Collect the scope from root -> current, then iterate in reverse
-        // so we effectively walk current -> root.
         let scope: Vec<_> = curr.scope().from_root().collect();
         for s in scope.into_iter().rev() {
             if svc.is_none() {
@@ -240,7 +312,7 @@ where
                     svc = Some(sl.0.clone());
                 }
             }
-            if func.is_none() && s.name() != "request" {
+            if func.is_none() && s.name() != "request" && s.name() != SVC_CTX_SPAN {
                 func = Some(s.name().to_string());
             }
             if svc.is_some() && func.is_some() {
@@ -307,7 +379,8 @@ pub mod client {
     use std::task::{Context, Poll};
 
     struct ClientMetrics {
-        target_service: &'static str,
+        target_service: String,
+        model_name: String,
     }
 
     #[async_trait]
@@ -315,27 +388,25 @@ pub mod client {
         async fn handle(
             &self,
             req: Request,
-            // FIX: Use standard http::Extensions (re-exported by Axum)
             extensions: &mut axum::http::Extensions,
             next: Next<'_>,
         ) -> Result<Response> {
             let start = Instant::now();
             let method = req.method().to_string();
 
-            // Execute
             let res = next.run(req, extensions).await;
 
-            let duration = start.elapsed().as_secs_f64();
+            let duration = start.elapsed().as_millis() as f64;
             let status = match &res {
                 Ok(r) => r.status().as_u16().to_string(),
                 Err(_) => "error".to_string(),
             };
 
-            // Record "Time to Headers"
-            histogram!("external_request_duration_seconds",
-                "target" => self.target_service,
+            histogram!("external_request_duration_seconds_ms",
+                "target" => self.target_service.clone(),
                 "method" => method,
-                "status" => status
+                "status" => status,
+                "model" => self.model_name.clone(),
             )
             .record(duration);
 
@@ -343,26 +414,26 @@ pub mod client {
         }
     }
 
-    /// Create a client that automatically tracks outbound latency
-    pub fn create_client(target_service: &'static str) -> ClientWithMiddleware {
+    pub fn create_client(target_service: &str, model_name: &str) -> ClientWithMiddleware {
         let client = Client::builder().build().unwrap();
         ClientBuilder::new(client)
-            .with(ClientMetrics { target_service })
+            .with(ClientMetrics {
+                target_service: target_service.to_string(),
+                model_name: model_name.to_string(),
+            })
             .build()
     }
 
-    // --- B. The Stream Wrapper ---
-
     struct ClientStreamGuard {
         start: Instant,
-        service: &'static str,
+        service: String,
+        model_name: String,
     }
 
     impl Drop for ClientStreamGuard {
         fn drop(&mut self) {
-            // Record total time from start of stream to finish/drop
-            let duration = self.start.elapsed().as_secs_f64();
-            histogram!("external_stream_duration_seconds", "service" => self.service)
+            let duration = self.start.elapsed().as_millis() as f64;
+            histogram!("external_stream_duration_seconds_ms", "service" => self.service.clone(), "model" => self.model_name.clone())
                 .record(duration);
         }
     }
@@ -385,7 +456,6 @@ pub mod client {
             let this = self.project();
             match this.inner.poll_next(cx) {
                 Poll::Ready(None) => {
-                    // Stream ended naturally. Drop guard to record metric.
                     let _ = this._guard.take();
                     Poll::Ready(None)
                 }
@@ -394,8 +464,11 @@ pub mod client {
         }
     }
 
-    /// Wrap an external stream (like OpenAI response) to track its full duration
-    pub fn track_stream<S, I, E>(stream: S, service_name: &'static str) -> MonitoredStream<S>
+    pub fn track_stream<S, I, E>(
+        stream: S,
+        service_name: &str,
+        model_name: &str,
+    ) -> MonitoredStream<S>
     where
         S: Stream<Item = std::result::Result<I, E>>,
     {
@@ -403,34 +476,36 @@ pub mod client {
             inner: stream,
             _guard: Some(ClientStreamGuard {
                 start: Instant::now(),
-                service: service_name,
+                service: service_name.to_string(),
+                model_name: model_name.to_string(),
             }),
         }
     }
 
     pub trait TrackExternal: Sized {
-        fn track_external(self, service: &'static str) -> ExternalRequestFuture<Self>;
+        fn track_external(self, service: &str, model_name: &str) -> ExternalRequestFuture<Self>;
     }
 
     impl<F> TrackExternal for F
     where
         F: Future,
     {
-        fn track_external(self, service: &'static str) -> ExternalRequestFuture<Self> {
+        fn track_external(self, service: &str, model_name: &str) -> ExternalRequestFuture<Self> {
             ExternalRequestFuture {
                 inner: self,
-                service,
+                service: service.to_string(),
                 start: Instant::now(),
+                model_name: model_name.to_string(),
             }
         }
     }
 
     pin_project! {
-        /// A Future that times its execution and records 'external_request_duration_seconds'
         pub struct ExternalRequestFuture<F> {
             #[pin]
             inner: F,
-            service: &'static str,
+            service: String,
+            model_name: String,
             start: Instant,
         }
     }
@@ -445,13 +520,13 @@ pub mod client {
             let this = self.project();
             match this.inner.poll(cx) {
                 Poll::Ready(result) => {
-                    let duration = this.start.elapsed().as_secs_f64();
+                    let duration = this.start.elapsed().as_millis() as f64;
 
-                    // Record Latency
-                    histogram!("external_request_duration_seconds",
-                        "target" => *this.service, // Using 'target' label for consistency
-                        "method" => "POST",        // Assumption for RPC/LLM calls
-                        "status" => "completed"    // We don't inspect inner Result here
+                    histogram!("external_request_duration_seconds_ms",
+                        "target" => this.service.clone(),
+                        "method" => "POST",
+                        "status" => "completed",
+                        "model" => this.model_name.clone(),
                     )
                     .record(duration);
 
@@ -465,29 +540,25 @@ pub mod client {
 
 pub fn setup_observability() -> Result<&'static PrometheusHandle, String> {
     let handle = RECORDER_HANDLE.get_or_init(|| {
-        let builder = PrometheusBuilder::new()
-            .set_buckets_for_metric(
-                Matcher::Full("http_request_duration_seconds".to_string()),
-                &[0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
-            )
-            .expect("failed to set buckets");
-
-        let handle = builder
+        let handle = PrometheusBuilder::new()
             .install_recorder()
             .expect("Failed to install recorder");
 
         describe_counter!("http_requests_total", "Total HTTP requests");
         describe_gauge!("http_requests_active", "Active connections");
-        describe_histogram!("http_request_duration_seconds", "HTTP Latency");
-        describe_histogram!("function_duration_seconds", "Internal Latency");
+        describe_histogram!("http_request_duration_seconds_ms", "HTTP Latency");
+        describe_histogram!("function_duration_seconds_ms", "Internal Latency");
         describe_counter!("function_errors_total", "Internal Errors");
-        describe_histogram!("external_request_duration_seconds", "Outbound HTTP Latency");
         describe_histogram!(
-            "external_stream_duration_seconds",
+            "external_request_duration_seconds_ms",
+            "Outbound HTTP Latency"
+        );
+        describe_histogram!(
+            "external_stream_duration_seconds_ms",
             "Outbound Stream Duration"
         );
         describe_histogram!(
-            "external_stream_ttft_seconds",
+            "external_stream_ttft_seconds_ms",
             "Time to first token for outbound streams"
         );
 

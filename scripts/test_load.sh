@@ -81,15 +81,15 @@ check_labels() {
 
 echo "-------------------------------------------------"
 # Core Metrics
-check_labels 'http_requests_active' "Active SSE Connection" 'type="sse"' 'service="gateway"'
+check_labels 'http_requests_active' "Active SSE Connection" 'type="sse"'
 # Note: We use specific counters, not regex start anchors, to be safer
 check_labels 'function_errors_total' "Business Logic Errors" 'function="process_payment"' 'service="order_service"'
 check_labels 'function_errors_total' "Background Task Errors" 'function="email_user"' 'service="order_service"'
 
 # LLM Metrics
-check_labels 'external_request_duration_seconds_count' "LLM Unary Latency" 'target="gpt_unary"' 'method="POST"' 'status="completed"'
-check_labels 'external_request_duration_seconds_count' "LLM Stream Handshake" 'target="gpt_handshake"' 'method="POST"' 'status="completed"'
-check_labels 'external_stream_duration_seconds_count' "LLM Stream Generation" 'service="gpt_generation"'
+check_labels 'external_request_duration_seconds_ms_count' "LLM Unary Latency" 'target="gpt_unary"' 'method="POST"' 'status="completed"'
+check_labels 'external_request_duration_seconds_ms_count' "LLM Stream Handshake" 'target="gpt_handshake"' 'method="POST"' 'status="completed"'
+check_labels 'external_stream_duration_seconds_ms_count' "LLM Stream Generation" 'service="gpt_generation"'
 echo "-------------------------------------------------"
 
 # Cleanup
