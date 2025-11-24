@@ -5,7 +5,6 @@ use axum::{
     middleware::Next,
 };
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
-// CHANGED: Added `Matcher` to imports
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use pin_project_lite::pin_project;
 use reqwest::header::CONTENT_TYPE;
@@ -497,7 +496,7 @@ pub fn setup_observability() -> Result<&'static PrometheusHandle, String> {
 
         let log_filter = Targets::new()
             .with_target(METRIC_TARGET, LevelFilter::OFF)
-            .with_default(LevelFilter::INFO);
+            .with_default(LevelFilter::ERROR);
 
         let _ = tracing_subscriber::registry()
             .with(

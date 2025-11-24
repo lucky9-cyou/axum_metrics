@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::net::TcpListener;
- // Needed for manual stream reading
+// Needed for manual stream reading
 
 use observability_lib::client::{TrackExternal, track_stream};
 use observability_lib::{
@@ -19,7 +19,10 @@ use observability_lib::{
 use async_openai::{
     Client,
     config::OpenAIConfig,
-    types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, CreateChatCompletionStreamResponse},
+    types::{
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+        CreateChatCompletionStreamResponse,
+    },
 };
 
 #[tokio::main]
@@ -66,7 +69,6 @@ fn get_openai_client() -> Client<OpenAIConfig> {
         .with_api_key(api_key)
         .with_api_base(base_url);
 
-
     Client::with_config(config)
 }
 
@@ -102,7 +104,7 @@ async fn llm_stream_handler() -> Json<Value> {
     });
 
     tracing::info!("Starting Stream Request...");
-    
+
     // Start timing for local chunk logic
     let start_local = std::time::Instant::now();
 
@@ -165,16 +167,19 @@ async fn llm_stream_handler() -> Json<Value> {
                     }
                     Err(e) => {
                         tracing::error!("Stream Error: {:?}", e);
-                        return Json(json!({ "error": "Stream interrupted", "details": e.to_string() }));
+                        return Json(
+                            json!({ "error": "Stream interrupted", "details": e.to_string() }),
+                        );
                     }
                 }
             }
 
-            let response_meta = last_response_meta.unwrap_or_else(|| json!({"warning": "no_chunks"}));
-            
+            let response_meta =
+                last_response_meta.unwrap_or_else(|| json!({"warning": "no_chunks"}));
+
             tracing::info!("Stream Complete. Content length: {}", acc.len());
 
-            Json(json!({ 
+            Json(json!({
                 "reply": acc,
                 "meta": response_meta,
                 "chunk_count": idx
@@ -186,7 +191,6 @@ async fn llm_stream_handler() -> Json<Value> {
         }
     }
 }
-
 
 #[tracing::instrument(fields(service = "llm_service"), ret)]
 async fn llm_unary_handler() -> Json<Value> {

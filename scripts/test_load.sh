@@ -95,3 +95,5 @@ echo "-------------------------------------------------"
 # Cleanup
 kill $SSE_PID 2>/dev/null
 echo -e "${BLUE}Test Complete.${NC}"
+
+echo "${METRICS}"
