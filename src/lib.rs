@@ -577,9 +577,12 @@ pub mod client {
 pub fn setup_observability() -> Result<&'static PrometheusHandle, String> {
     let handle = RECORDER_HANDLE.get_or_init(|| {
         let handle = PrometheusBuilder::new()
-            .set_buckets(&vec![
-                500_f64, 1000_f64, 1500_f64, 2000_f64, 2500_f64, 3000_f64, 3500_f64,
-            ])
+            .set_buckets(
+                &((100..=10000)
+                    .step_by(100)
+                    .map(|x| x as f64)
+                    .collect::<Vec<f64>>()),
+            )
             .unwrap()
             .install_recorder()
             .expect("Failed to install recorder");
