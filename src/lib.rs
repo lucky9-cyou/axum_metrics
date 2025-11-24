@@ -121,7 +121,7 @@ impl Drop for ConnectionGuard {
             "type" => self.type_label,
             "service" => self.service_label.clone()
         )
-        .record(self.start.elapsed().as_secs_f64());
+        .record(self.start.elapsed().as_millis() as f64);
     }
 }
 
