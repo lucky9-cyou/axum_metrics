@@ -1,5 +1,3 @@
-// lib.rs (observability_lib)
-
 use axum::{
     body::Body,
     extract::{MatchedPath, State},
@@ -11,7 +9,6 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use pin_project_lite::pin_project;
 use reqwest::header::CONTENT_TYPE;
 use std::{
-    borrow::Cow,
     future::Future,
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -29,10 +26,6 @@ use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 static RECORDER_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 const METRIC_TARGET: &str = "metrics::signal";
 const SVC_CTX_SPAN: &str = "svc_ctx";
-
-// ----------------------------------------------------------------------------
-// Service tagging (application name per route), user-definable
-// ----------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 pub struct ServiceTag(pub String);
@@ -105,15 +98,30 @@ pub async fn tag_service_with_state(
 struct ConnectionGuard {
     type_label: &'static str,
     service_label: String,
+    route: String,
+    method: String,
+    start: Instant,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        gauge!("http_requests_active",
+        // Active connections gauge
+        gauge!(
+            "http_requests_active",
             "type" => self.type_label,
             "service" => self.service_label.clone()
         )
         .decrement(1.0);
+
+        // Full duration from request start until body is fully sent / stream is closed
+        histogram!(
+            "http_request_duration_seconds_ms",
+            "route" => self.route.clone(),
+            "method" => self.method.clone(),
+            "type" => self.type_label,
+            "service" => self.service_label.clone()
+        )
+        .record(self.start.elapsed().as_secs_f64());
     }
 }
 
@@ -140,6 +148,7 @@ where
         let this = self.project();
         match this.inner.poll_frame(cx) {
             Poll::Ready(None) => {
+                // When the body stream finishes (including SSE), drop the guard
                 let _ = this._guard.take();
                 Poll::Ready(None)
             }
@@ -151,11 +160,12 @@ where
 pub async fn traffic_layer(req: Request<Body>, next: Next) -> Response<Body> {
     let start = Instant::now();
 
+    // Use owned String to be able to move into the guard
     let route = req
         .extensions()
         .get::<MatchedPath>()
-        .map(|m| Cow::Owned(m.as_str().to_owned()))
-        .unwrap_or(Cow::Borrowed("unmatched_route"));
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched_route".to_string());
 
     let method = req.method().as_str().to_owned();
 
@@ -176,7 +186,7 @@ pub async fn traffic_layer(req: Request<Body>, next: Next) -> Response<Body> {
         .map(|ct| ct.to_ascii_lowercase().starts_with("text/event-stream"))
         .unwrap_or(false);
 
-    let type_lbl = if is_ws_handshake {
+    let type_lbl: &'static str = if is_ws_handshake {
         "websocket"
     } else if is_sse {
         "sse"
@@ -184,7 +194,9 @@ pub async fn traffic_layer(req: Request<Body>, next: Next) -> Response<Body> {
         "http"
     };
 
-    counter!("http_requests_total",
+    // Count requests (handshake for websocket, initial response for SSE/HTTP)
+    counter!(
+        "http_requests_total",
         "route" => route.clone(),
         "method" => method.clone(),
         "status" => status,
@@ -193,53 +205,69 @@ pub async fn traffic_layer(req: Request<Body>, next: Next) -> Response<Body> {
     )
     .increment(1);
 
-    if !is_ws_handshake {
-        histogram!("http_request_duration_seconds_ms",
-            "route" => route.clone(),
-            "method" => method.clone(),
-            "type" => type_lbl,
-            "service" => service.clone()
-        )
-        .record(start.elapsed().as_secs_f64());
-    }
-
+    // For websocket upgrade we don't wrap the body, duration is tracked separately by WsTracker
     if is_ws_handshake {
-        response
-    } else {
-        gauge!("http_requests_active",
-            "type" => type_lbl,
-            "service" => service.clone()
-        )
-        .increment(1.0);
-
-        let (parts, body) = response.into_parts();
-        let monitored_body = MonitoredBody {
-            inner: body,
-            _guard: Some(ConnectionGuard {
-                type_label: if is_sse { "sse" } else { "http" },
-                service_label: service,
-            }),
-        };
-        Response::from_parts(parts, Body::new(monitored_body))
+        return response;
     }
+
+    // For HTTP and SSE we track active connections via a guard that lives as long as the body
+    gauge!(
+        "http_requests_active",
+        "type" => type_lbl,
+        "service" => service.clone()
+    )
+    .increment(1.0);
+
+    let (parts, body) = response.into_parts();
+    let monitored_body = MonitoredBody {
+        inner: body,
+        _guard: Some(ConnectionGuard {
+            type_label: if is_sse { "sse" } else { "http" },
+            service_label: service,
+            route,
+            method,
+            start,
+        }),
+    };
+    Response::from_parts(parts, Body::new(monitored_body))
 }
 
 pub struct WsTracker {
     service: &'static str,
+    start: Instant,
 }
 
 impl WsTracker {
     pub fn new(service: &'static str) -> Self {
-        gauge!("http_requests_active", "type" => "websocket_session", "service" => service)
-            .increment(1.0);
-        Self { service }
+        gauge!(
+            "http_requests_active",
+            "type" => "websocket_session",
+            "service" => service
+        )
+        .increment(1.0);
+
+        Self {
+            service,
+            start: Instant::now(),
+        }
     }
 }
 
 impl Drop for WsTracker {
     fn drop(&mut self) {
-        gauge!("http_requests_active", "type" => "websocket_session", "service" => self.service)
-            .decrement(1.0);
+        gauge!(
+            "http_requests_active",
+            "type" => "websocket_session",
+            "service" => self.service
+        )
+        .decrement(1.0);
+
+        // Track full websocket session duration
+        histogram!(
+            "websocket_session_duration_seconds_ms",
+            "service" => self.service
+        )
+        .record(self.start.elapsed().as_millis() as f64);
     }
 }
 
@@ -286,7 +314,8 @@ where
             .map(|s| s.0.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        histogram!("function_duration_seconds_ms",
+        histogram!(
+            "function_duration_seconds_ms",
             "function" => name,
             "service" => service
         )
@@ -323,7 +352,8 @@ where
         let service = svc.unwrap_or_else(|| "unknown".to_string());
         let function = func.unwrap_or_else(|| curr.name().to_string());
 
-        counter!("function_errors_total",
+        counter!(
+            "function_errors_total",
             "service" => service,
             "function" => function
         )
@@ -402,7 +432,8 @@ pub mod client {
                 Err(_) => "error".to_string(),
             };
 
-            histogram!("external_request_duration_seconds_ms",
+            histogram!(
+                "external_request_duration_seconds_ms",
                 "target" => self.target_service.clone(),
                 "method" => method,
                 "status" => status,
@@ -433,8 +464,12 @@ pub mod client {
     impl Drop for ClientStreamGuard {
         fn drop(&mut self) {
             let duration = self.start.elapsed().as_millis() as f64;
-            histogram!("external_stream_duration_seconds_ms", "service" => self.service.clone(), "model" => self.model_name.clone())
-                .record(duration);
+            histogram!(
+                "external_stream_duration_seconds_ms",
+                "service" => self.service.clone(),
+                "model" => self.model_name.clone()
+            )
+            .record(duration);
         }
     }
 
@@ -522,7 +557,8 @@ pub mod client {
                 Poll::Ready(result) => {
                     let duration = this.start.elapsed().as_millis() as f64;
 
-                    histogram!("external_request_duration_seconds_ms",
+                    histogram!(
+                        "external_request_duration_seconds_ms",
                         "target" => this.service.clone(),
                         "method" => "POST",
                         "status" => "completed",
@@ -546,7 +582,10 @@ pub fn setup_observability() -> Result<&'static PrometheusHandle, String> {
 
         describe_counter!("http_requests_total", "Total HTTP requests");
         describe_gauge!("http_requests_active", "Active connections");
-        describe_histogram!("http_request_duration_seconds_ms", "HTTP Latency");
+        describe_histogram!(
+            "http_request_duration_seconds_ms",
+            "HTTP Latency (full body/stream duration)"
+        );
         describe_histogram!("function_duration_seconds_ms", "Internal Latency");
         describe_counter!("function_errors_total", "Internal Errors");
         describe_histogram!(
@@ -560,6 +599,10 @@ pub fn setup_observability() -> Result<&'static PrometheusHandle, String> {
         describe_histogram!(
             "external_stream_ttft_seconds_ms",
             "Time to first token for outbound streams"
+        );
+        describe_histogram!(
+            "websocket_session_duration_seconds_ms",
+            "Duration of WebSocket sessions"
         );
 
         use tracing_subscriber::filter::{LevelFilter, Targets};
